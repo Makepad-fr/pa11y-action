@@ -1,4 +1,5 @@
-FROM ghcr.io/puppeteer/puppeteer:16.1.0
+ARG PUPPETEER_VERSION="16.1.0"
+FROM ghcr.io/puppeteer/puppeteer:${PUPPETEER_VERSION}
 
 USER root 
 
