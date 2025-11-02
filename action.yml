@@ -1,0 +1,190 @@
+name: "Run Pa11y (Docker)"
+description: "Reusable action to run Pa11y via makepad/pa11y Docker image on a given URL and output a JSON report."
+author: "Makepad"
+branding:
+  icon: check-circle
+  color: green
+
+
+inputs:
+  url:
+    description: "Target URL to audit (e.g., https://example.com)."
+    required: true
+  standard:
+    description: "Accessibility standard for Pa11y (e.g., WCAG2A, WCAG2AA, WCAG2AAA)."
+    default: "WCAG2AA"
+    required: false
+  threshold:
+    description: "Number of allowed issues before failing the action. 0 fails on any issue."
+    default: "0"
+    required: false
+  wait:
+    description: "Wait time in ms before Pa11y runs (useful for client-side rendering)."
+    default: "0"
+    required: false
+  headers:
+    description: "JSON string of request headers (e.g., '{\"Authorization\": \"Bearer ...\"}')"
+    required: false
+    default: ""
+  extra_args:
+    description: "Extra CLI args passed verbatim to Pa11y (advanced users)."
+    required: false
+    default: ""
+  reporter:
+    description: "Pa11y reporter (json, csv, html, cli). JSON recommended for CI."
+    required: false
+    default: "json"
+  report_file:
+    description: "Path/filename for the generated report inside the workspace."
+    required: false
+    default: "pa11y-report.json"
+  docker_image:
+    description: "Docker image to use."
+    required: false
+    default: "makepad/pa11y:latest"
+  network:
+    description: "Optional Docker network to attach to (e.g., your reverse-proxy/test network)."
+    required: false
+    default: ""
+
+outputs:
+  report_path:
+    description: "Path to the generated report file."
+    value: ${{ steps.run-pa11y.outputs.report_path }}
+  exit_code:
+    description: "Exit code from the Pa11y run (0 = success)."
+    value: ${{ steps.run-pa11y.outputs.exit_code }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Ensure Docker is available
+      shell: bash
+      run: |
+        if ! command -v docker >/dev/null 2>&1; then
+          echo "Docker is required for this action." >&2
+          exit 1
+        fi
+
+    - name: Pull Pa11y image
+      shell: bash
+      run: |
+        docker pull "${{ inputs.docker_image }}"
+
+    - name: Run Pa11y
+      id: run-pa11y
+      shell: bash
+      env:
+        INPUT_URL: ${{ inputs.url }}
+        INPUT_STANDARD: ${{ inputs.standard }}
+        INPUT_THRESHOLD: ${{ inputs.threshold }}
+        INPUT_WAIT: ${{ inputs.wait }}
+        INPUT_HEADERS: ${{ inputs.headers }}
+        INPUT_EXTRA_ARGS: ${{ inputs.extra_args }}
+        INPUT_REPORTER: ${{ inputs.reporter }}
+        INPUT_REPORT_FILE: ${{ inputs.report_file }}
+        INPUT_DOCKER_IMAGE: ${{ inputs.docker_image }}
+        INPUT_NETWORK: ${{ inputs.network }}
+      run: |
+        set -euo pipefail
+
+        # Normalize workspace path and report path
+        WORKDIR="${GITHUB_WORKSPACE:-$(pwd)}"
+        REPORT_PATH="$WORKDIR/${INPUT_REPORT_FILE}"
+
+        # Build optional flags
+        FLAGS=("--standard" "$INPUT_STANDARD")
+
+        if [[ -n "$INPUT_WAIT" && "$INPUT_WAIT" != "0" ]]; then
+          FLAGS+=("--wait" "$INPUT_WAIT")
+        fi
+
+        if [[ -n "$INPUT_HEADERS" ]]; then
+          # Validate that headers look like JSON; if not, fail early to be user-friendly.
+          if python - <<'PY'
+        import json, os, sys
+        h=os.environ.get('INPUT_HEADERS','').strip()
+        try:
+            json.loads(h)
+        except Exception as e:
+            print(f"Invalid JSON in 'headers': {e}")
+            sys.exit(1)
+        PY
+          then
+            FLAGS+=("--headers" "$INPUT_HEADERS")
+          else
+            echo "Provided headers are not valid JSON." >&2
+            exit 2
+          fi
+        fi
+
+        if [[ -n "$INPUT_EXTRA_ARGS" ]]; then
+          # shellcheck disable=SC2206
+          EXTRA_ARR=( $INPUT_EXTRA_ARGS )
+        else
+          EXTRA_ARR=()
+        fi
+
+        CONTAINER_NAME="pa11y_${GITHUB_RUN_ID:-local}_$RANDOM"
+
+        DOCKER_ARGS=(
+          run --rm --name "$CONTAINER_NAME"
+          -v "$WORKDIR:/work"
+          -w /work
+        )
+
+        if [[ -n "$INPUT_NETWORK" ]]; then
+          DOCKER_ARGS+=( --network "$INPUT_NETWORK" )
+        fi
+
+        # Execute Pa11y inside the container
+        set +e
+        docker "${DOCKER_ARGS[@]}" "$INPUT_DOCKER_IMAGE" \
+           "$INPUT_URL" \
+          --reporter "$INPUT_REPORTER" \
+          "${FLAGS[@]}" \
+          "${EXTRA_ARR[@]}" \
+          > "$REPORT_PATH"
+        EXIT_CODE=$?
+        set -e
+
+        echo "Report written to: $REPORT_PATH"
+        echo "Pa11y exit code: $EXIT_CODE"
+
+        # Expose outputs
+        echo "report_path=$REPORT_PATH" >> "$GITHUB_OUTPUT"
+        echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+        # Fail based on threshold if reporter is json and threshold >= 0
+        if [[ "$INPUT_REPORTER" == "json" ]]; then
+          python - <<PY
+        import json, os, sys
+        p=os.environ['REPORT_PATH']
+        threshold=int(os.environ.get('INPUT_THRESHOLD','0'))
+        with open(p,'r',encoding='utf-8') as f:
+        try:
+            data=json.load(f)
+        except Exception:
+            # If output is not JSON (e.g., site crashed), bubble up container exit code instead
+            print('Warning: Report was not valid JSON; skipping threshold check.')
+            sys.exit(0)
+
+        # Pa11y json reporter returns a list of issues
+        issues = data if isinstance(data, list) else data.get('issues', [])
+        count = len(issues)
+        print(f"Found {count} issues (threshold {threshold}).")
+        if threshold >= 0 and count > threshold:
+            sys.exit(1)
+        PY
+          THRESHOLD_EXIT=$?
+          if [[ $THRESHOLD_EXIT -ne 0 ]]; then
+            echo "Pa11y issues exceed threshold (${INPUT_THRESHOLD})." >&2
+            exit 1
+          fi
+        fi
+
+        # Also respect non-zero container exit code
+        if [[ $EXIT_CODE -ne 0 ]]; then
+          echo "Pa11y exited with non-zero status: $EXIT_CODE" >&2
+          exit $EXIT_CODE
+        fi
