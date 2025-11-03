@@ -100,20 +100,11 @@ runs:
         fi
 
         if [[ -n "$INPUT_HEADERS" ]]; then
-          # Validate that headers look like JSON; if not, fail early to be user-friendly.
-          if python - <<'PY'
-        import json, os, sys
-        h=os.environ.get('INPUT_HEADERS','').strip()
-        try:
-            json.loads(h)
-        except Exception as e:
-            print(f"Invalid JSON in 'headers': {e}")
-            sys.exit(1)
-        PY
-          then
+          # Validate that headers look like JSON using jq (no Python).
+          if echo "$INPUT_HEADERS" | jq -e . >/dev/null 2>&1; then
             FLAGS+=("--headers" "$INPUT_HEADERS")
           else
-            echo "Provided headers are not valid JSON." >&2
+            echo "Provided headers are not valid JSON for --headers." >&2
             exit 2
           fi
         fi
@@ -131,6 +122,7 @@ runs:
           run --rm --name "$CONTAINER_NAME"
           -v "$WORKDIR:/work"
           -w /work
+          --shm-size 1g
         )
 
         if [[ -n "$INPUT_NETWORK" ]]; then
@@ -140,8 +132,11 @@ runs:
         # Execute Pa11y inside the container
         set +e
         docker "${DOCKER_ARGS[@]}" "$INPUT_DOCKER_IMAGE" \
-           "$INPUT_URL" \
+          pa11y "$INPUT_URL" \
           --reporter "$INPUT_REPORTER" \
+          --chrome-arg "--no-sandbox" \
+          --chrome-arg "--disable-setuid-sandbox" \
+          --chrome-arg "--disable-dev-shm-usage" \
           "${FLAGS[@]}" \
           "${EXTRA_ARR[@]}" \
           > "$REPORT_PATH"
@@ -155,36 +150,42 @@ runs:
         echo "report_path=$REPORT_PATH" >> "$GITHUB_OUTPUT"
         echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
 
-        # Fail based on threshold if reporter is json and threshold >= 0
-        if [[ "$INPUT_REPORTER" == "json" ]]; then
-          python - <<PY
-        import json, os, sys
-        p=os.environ['REPORT_PATH']
-        threshold=int(os.environ.get('INPUT_THRESHOLD','0'))
-        with open(p,'r',encoding='utf-8') as f:
-        try:
-            data=json.load(f)
-        except Exception:
-            # If output is not JSON (e.g., site crashed), bubble up container exit code instead
-            print('Warning: Report was not valid JSON; skipping threshold check.')
-            sys.exit(0)
 
-        # Pa11y json reporter returns a list of issues
-        issues = data if isinstance(data, list) else data.get('issues', [])
-        count = len(issues)
-        print(f"Found {count} issues (threshold {threshold}).")
-        if threshold >= 0 and count > threshold:
-            sys.exit(1)
-        PY
-          THRESHOLD_EXIT=$?
-          if [[ $THRESHOLD_EXIT -ne 0 ]]; then
-            echo "Pa11y issues exceed threshold (${INPUT_THRESHOLD})." >&2
-            exit 1
-          fi
+    - name: Enforce threshold (JSON reporter)
+      if: ${{ inputs.reporter == 'json' }}
+      shell: bash
+      env:
+        REPORT_PATH: ${{ steps.run-pa11y.outputs.report_path }}
+        INPUT_THRESHOLD: ${{ inputs.threshold }}
+      run: |
+        set -euo pipefail
+        if [[ ! -s "$REPORT_PATH" ]]; then
+          echo "Report file not found or empty: $REPORT_PATH" >&2
+          exit 1
+        fi
+        # Count issues for array-form or object-with-issues-form
+        if COUNT=$(jq -r 'if type=="array" then length elif type=="object" and has("issues") then .issues|length else 0 end' "$REPORT_PATH" 2>/dev/null); then
+          :
+        else
+          echo "Warning: Report is not valid JSON; skipping threshold check." >&2
+          exit 0
+        fi
+        echo "Found $COUNT issues (threshold ${INPUT_THRESHOLD})."
+        if [[ ${INPUT_THRESHOLD} -ge 0 && $COUNT -gt ${INPUT_THRESHOLD} ]]; then
+          echo "Pa11y issues exceed threshold (${INPUT_THRESHOLD})." >&2
+          exit 1
         fi
 
-        # Also respect non-zero container exit code
-        if [[ $EXIT_CODE -ne 0 ]]; then
+    - name: Fail if Pa11y exited non-zero
+      shell: bash
+      run: |
+        set -euo pipefail
+        EXIT_CODE='${{ steps.run-pa11y.outputs.exit_code }}'
+        if [[ -z "$EXIT_CODE" ]]; then
+          echo "Missing Pa11y exit code output." >&2
+          exit 1
+        fi
+        if [[ "$EXIT_CODE" -ne 0 ]]; then
           echo "Pa11y exited with non-zero status: $EXIT_CODE" >&2
-          exit $EXIT_CODE
+          exit "$EXIT_CODE"
         fi
