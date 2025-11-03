@@ -134,10 +134,10 @@ runs:
         docker "${DOCKER_ARGS[@]}" \
           -e "PUPPETEER_ARGS=--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage" \
           "$INPUT_DOCKER_IMAGE" \
-          pa11y "$INPUT_URL" \
           --reporter "$INPUT_REPORTER" \
           "${FLAGS[@]}" \
           "${EXTRA_ARR[@]}" \
+          "$INPUT_URL" \
           > "$REPORT_PATH"
         EXIT_CODE=$?
         set -e
@@ -169,8 +169,8 @@ runs:
 
         if ! jq -e . "$JSON_REPORT" >/dev/null 2>&1; then
           echo "Warning: Report is not valid JSON even after cleanup: $JSON_REPORT" >&2
-          echo "--- Begin sniff (first 200 chars) ---"
-          head -c 200 "$REPORT_PATH" || true
+          echo "--- Begin sniff (first 400 chars) ---"
+          head -c 400 "$REPORT_PATH" || true
           echo "\n--- End sniff ---"
           exit 0
         fi
@@ -195,7 +195,8 @@ runs:
         if [[ "$EXIT_CODE" -ne 0 ]]; then
           echo "Pa11y exited with non-zero status: $EXIT_CODE" >&2
           exit "$EXIT_CODE"
-
+        fi
+        
     - name: Upload Pa11y report artifact
       uses: actions/upload-artifact@v4
       with:
