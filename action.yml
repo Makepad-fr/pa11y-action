@@ -1,10 +1,9 @@
-name: "Run Pa11y (Docker)"
-description: "Reusable action to run Pa11y via makepad/pa11y Docker image on a given URL and output a JSON report."
+name: "Run Pa11yCI (Node.js)"
+description: "Reusable action to run Pa11yCI (pa11y/pa11y-ci) on a given URL and write a JSON report. No Docker required."
 author: "Makepad"
 branding:
   icon: check-circle
   color: green
-
 
 inputs:
   url:
@@ -15,7 +14,7 @@ inputs:
     default: "WCAG2AA"
     required: false
   threshold:
-    description: "Number of allowed issues before failing the action. 0 fails on any issue."
+    description: "Number of allowed issues before failing the action. 0 fails on any issue (handled by pa11y-ci)."
     default: "0"
     required: false
   wait:
@@ -27,52 +26,55 @@ inputs:
     required: false
     default: ""
   extra_args:
-    description: "Extra CLI args passed verbatim to Pa11y (advanced users)."
+    description: "Extra CLI args passed verbatim to pa11y-ci (advanced users)."
     required: false
     default: ""
   reporter:
-    description: "Pa11y reporter (json, csv, html, cli). JSON recommended for CI."
+    description: "Reporter for pa11y-ci output (json or junit)."
     required: false
     default: "json"
   report_file:
     description: "Path/filename for the generated report inside the workspace."
     required: false
     default: "pa11y-report.json"
-  docker_image:
-    description: "Docker image to use."
+  node_version:
+    description: "Node.js version to use via actions/setup-node."
     required: false
-    default: "makepad/pa11y:latest"
-  network:
-    description: "Optional Docker network to attach to (e.g., your reverse-proxy/test network)."
-    required: false
-    default: ""
+    default: "24"
 
 outputs:
   report_path:
     description: "Path to the generated report file."
-    value: ${{ steps.run-pa11y.outputs.report_path }}
+    value: ${{ steps.run-pa11yci.outputs.report_path }}
   exit_code:
-    description: "Exit code from the Pa11y run (0 = success)."
-    value: ${{ steps.run-pa11y.outputs.exit_code }}
+    description: "Exit code from the pa11y-ci run (0 = success)."
+    value: ${{ steps.run-pa11yci.outputs.exit_code }}
 
 runs:
   using: "composite"
   steps:
-    - name: Ensure Docker is available
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node_version }}
+        cache: 'npm'
+
+    - name: Install pa11y-ci
       shell: bash
       run: |
-        if ! command -v docker >/dev/null 2>&1; then
-          echo "Docker is required for this action." >&2
-          exit 1
-        fi
+        set -euo pipefail
+        npm --version
+        # Install pa11y-ci locally in a temp dir to avoid polluting user's repo
+        TMP_NPM_DIR=".pa11yci_tmp_install"
+        mkdir -p "$TMP_NPM_DIR"
+        pushd "$TMP_NPM_DIR" >/dev/null
+        npm init -y >/dev/null 2>&1
+        npm install --no-fund --no-audit pa11y-ci@latest >/dev/null 2>&1 || npm install pa11y-ci@latest
+        echo "PA11Y_CI_BIN=$(pwd)/node_modules/.bin/pa11y-ci" >> $GITHUB_ENV
+        popd >/dev/null
 
-    - name: Pull Pa11y image
-      shell: bash
-      run: |
-        docker pull "${{ inputs.docker_image }}"
-
-    - name: Run Pa11y
-      id: run-pa11y
+    - name: Generate pa11y-ci config
+      id: gen-config
       shell: bash
       env:
         INPUT_URL: ${{ inputs.url }}
@@ -80,130 +82,94 @@ runs:
         INPUT_THRESHOLD: ${{ inputs.threshold }}
         INPUT_WAIT: ${{ inputs.wait }}
         INPUT_HEADERS: ${{ inputs.headers }}
-        INPUT_EXTRA_ARGS: ${{ inputs.extra_args }}
         INPUT_REPORTER: ${{ inputs.reporter }}
         INPUT_REPORT_FILE: ${{ inputs.report_file }}
-        INPUT_DOCKER_IMAGE: ${{ inputs.docker_image }}
-        INPUT_NETWORK: ${{ inputs.network }}
       run: |
         set -euo pipefail
-
-        # Normalize workspace path and report path
         WORKDIR="${GITHUB_WORKSPACE:-$(pwd)}"
         REPORT_PATH="$WORKDIR/${INPUT_REPORT_FILE}"
+        CONFIG_PATH="$WORKDIR/.pa11yci.temp.json"
 
-        # Build optional flags
-        FLAGS=("--standard" "$INPUT_STANDARD")
+        # Build defaults JSON
+        DEFAULTS_JSON=$(jq -n --arg standard "$INPUT_STANDARD" --argjson wait ${INPUT_WAIT:-0} '{standard: $standard, wait: $wait, chromeLaunchConfig: {args: ["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage"]}}')
 
-        if [[ -n "$INPUT_WAIT" && "$INPUT_WAIT" != "0" ]]; then
-          FLAGS+=("--wait" "$INPUT_WAIT")
-        fi
-
-        if [[ -n "$INPUT_HEADERS" ]]; then
-          # Validate that headers look like JSON using jq (no Python).
+        # If headers provided and valid JSON, merge into defaults
+        if [[ -n "${INPUT_HEADERS}" ]]; then
           if echo "$INPUT_HEADERS" | jq -e . >/dev/null 2>&1; then
-            FLAGS+=("--headers" "$INPUT_HEADERS")
+            DEFAULTS_JSON=$(jq -n --argjson defaults "$DEFAULTS_JSON" --argjson headers "$INPUT_HEADERS" '$defaults + {headers: $headers}')
           else
-            echo "Provided headers are not valid JSON for --headers." >&2
+            echo "Provided headers are not valid JSON; aborting." >&2
             exit 2
           fi
         fi
 
-        if [[ -n "$INPUT_EXTRA_ARGS" ]]; then
+        # Create the pa11y-ci config file
+        jq -n --arg url "$INPUT_URL" --argjson defaults "$DEFAULTS_JSON" '{urls: [$url], defaults: $defaults}' > "$CONFIG_PATH"
+
+        echo "config_path=$CONFIG_PATH" >> "$GITHUB_OUTPUT"
+        echo "report_path=$REPORT_PATH" >> "$GITHUB_OUTPUT"
+
+    - name: Run pa11y-ci
+      id: run-pa11yci
+      shell: bash
+      env:
+        PA11Y_CI_BIN: ${{ env.PA11Y_CI_BIN }}
+        CONFIG_PATH: ${{ steps.gen-config.outputs.config_path }}
+        INPUT_THRESHOLD: ${{ inputs.threshold }}
+        INPUT_REPORTER: ${{ inputs.reporter }}
+        INPUT_REPORT_PATH: ${{ steps.gen-config.outputs.report_path }}
+        INPUT_EXTRA_ARGS: ${{ inputs.extra_args }}
+      run: |
+        set -euo pipefail
+        if [[ -z "${PA11Y_CI_BIN:-}" || ! -x "$PA11Y_CI_BIN" ]]; then
+          echo "pa11y-ci binary not found at $PA11Y_CI_BIN" >&2
+          exit 1
+        fi
+
+        # Build arguments
+        ARGS=("--config" "$CONFIG_PATH" "--threshold" "$INPUT_THRESHOLD")
+        if [[ "$INPUT_REPORTER" == "json" ]]; then
+          ARGS+=("--json")
+        elif [[ "$INPUT_REPORTER" == "junit" ]]; then
+          ARGS+=("--reporter" "junit")
+        fi
+
+        # Handle extra args (split by spaces)
+        if [[ -n "${INPUT_EXTRA_ARGS}" ]]; then
           # shellcheck disable=SC2206
           EXTRA_ARR=( $INPUT_EXTRA_ARGS )
         else
           EXTRA_ARR=()
         fi
 
-        CONTAINER_NAME="pa11y_${GITHUB_RUN_ID:-local}_$RANDOM"
-
-        DOCKER_ARGS=(
-          run --rm --name "$CONTAINER_NAME"
-          -v "$WORKDIR:/work"
-          -w /work
-          --shm-size 1g
-          --security-opt seccomp=unconfined
-          --cap-add SYS_ADMIN
-        )
-
-        if [[ -n "$INPUT_NETWORK" ]]; then
-          DOCKER_ARGS+=( --network "$INPUT_NETWORK" )
-        fi
-
-        # Execute Pa11y inside the container
         set +e
-        docker "${DOCKER_ARGS[@]}" \
-          -e "PUPPETEER_ARGS=--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage" \
-          "$INPUT_DOCKER_IMAGE" \
-          --reporter "$INPUT_REPORTER" \
-          "${FLAGS[@]}" \
-          "${EXTRA_ARR[@]}" \
-          "$INPUT_URL" \
-          > "$REPORT_PATH"
+        "$PA11Y_CI_BIN" "${ARGS[@]}" "${EXTRA_ARR[@]}" > "$INPUT_REPORT_PATH"
         EXIT_CODE=$?
         set -e
 
-        echo "Report written to: $REPORT_PATH"
-        echo "Pa11y exit code: $EXIT_CODE"
+        echo "Report written to: $INPUT_REPORT_PATH"
+        echo "pa11y-ci exit code: $EXIT_CODE"
 
-        # Expose outputs
-        echo "report_path=$REPORT_PATH" >> "$GITHUB_OUTPUT"
+        echo "report_path=$INPUT_REPORT_PATH" >> "$GITHUB_OUTPUT"
         echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
 
-
-    - name: Enforce threshold (JSON reporter)
-      if: ${{ inputs.reporter == 'json' && steps.run-pa11y.outputs.exit_code == '0' }}
-      shell: bash
-      env:
-        REPORT_PATH: ${{ steps.run-pa11y.outputs.report_path }}
-        INPUT_THRESHOLD: ${{ inputs.threshold }}
-      run: |
-        set -euo pipefail
-        if [[ ! -s "$REPORT_PATH" ]]; then
-          echo "Report file not found or empty: $REPORT_PATH — skipping threshold (will rely on Pa11y exit code)." >&2
-          exit 0
-        fi
-
-        # Extract pure JSON starting at the first { or [ in case the tool prints banners/warnings to stdout
-        JSON_REPORT="${REPORT_PATH%.json}.clean.json"
-        awk 'found{print} /[\[{]/{found=1; print}' "$REPORT_PATH" > "$JSON_REPORT" || true
-
-        if ! jq -e . "$JSON_REPORT" >/dev/null 2>&1; then
-          echo "Warning: Report is not valid JSON even after cleanup: $JSON_REPORT" >&2
-          echo "--- Begin sniff (first 400 chars) ---"
-          head -c 400 "$REPORT_PATH" || true
-          echo "\n--- End sniff ---"
-          exit 0
-        fi
-
-        # Count issues for array-form or object-with-issues-form
-        COUNT=$(jq -r 'if type=="array" then length elif type=="object" and has("issues") then .issues|length else 0 end' "$JSON_REPORT")
-        echo "Found $COUNT issues (threshold ${INPUT_THRESHOLD})."
-        if [[ ${INPUT_THRESHOLD} -ge 0 && $COUNT -gt ${INPUT_THRESHOLD} ]]; then
-          echo "Pa11y issues exceed threshold (${INPUT_THRESHOLD})." >&2
-          exit 1
-        fi
-
-    - name: Fail if Pa11y exited non-zero
+    - name: Fail if pa11y-ci exited non-zero
       shell: bash
       run: |
         set -euo pipefail
-        EXIT_CODE='${{ steps.run-pa11y.outputs.exit_code }}'
+        EXIT_CODE='${{ steps.run-pa11yci.outputs.exit_code }}'
         if [[ -z "$EXIT_CODE" ]]; then
-          echo "Missing Pa11y exit code output." >&2
+          echo "Missing pa11y-ci exit code output." >&2
           exit 1
         fi
         if [[ "$EXIT_CODE" -ne 0 ]]; then
-          echo "Pa11y exited with non-zero status: $EXIT_CODE" >&2
+          echo "pa11y-ci exited with non-zero status: $EXIT_CODE" >&2
           exit "$EXIT_CODE"
         fi
-        
-    - name: Upload Pa11y report artifact
+
+    - name: Upload report artifact
       uses: actions/upload-artifact@v4
       with:
         name: pa11y-report
-        path: |
-          ${{ steps.run-pa11y.outputs.report_path }}
-          ${{ steps.run-pa11y.outputs.report_path && format('{0}.clean.json', steps.run-pa11y.outputs.report_path) || '' }}
+        path: ${{ steps.run-pa11yci.outputs.report_path }}
         if-no-files-found: warn
