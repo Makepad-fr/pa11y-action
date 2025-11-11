@@ -51,7 +51,4 @@ outputs:
 
 runs:
   using: "node24"
-  # Pre & Post hooks for setup/cleanup
-  pre: "dist/pre.js"
   main: "dist/index.js"
-  post: "dist/post.js"

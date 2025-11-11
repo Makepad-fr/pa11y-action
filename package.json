@@ -5,8 +5,8 @@
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
-    "build": "ncc build src/index.js -o dist && ncc build src/pre.js -o dist && ncc build src/post.js -o dist",
-    "lint": "eslint .",
+  "build": "ncc build src/index.js -o dist && ncc build src/pre.js -o dist && ncc build src/post.js -o dist"
+,    "lint": "eslint .",
     "test": "node --test"
   },
   "dependencies": {
