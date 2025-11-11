@@ -1,5 +1,5 @@
-name: "Run Pa11yCI (Node.js)"
-description: "Reusable action to run Pa11yCI (pa11y/pa11y-ci) on a given URL and write a JSON report. No Docker required."
+name: "Run Pa11y CI (Node)"
+description: "Reusable Node.js action that runs pa11y-ci against a URL or config and uploads a JSON report."
 author: "Makepad"
 branding:
   icon: check-circle
@@ -7,169 +7,51 @@ branding:
 
 inputs:
   url:
-    description: "Target URL to audit (e.g., https://example.com)."
-    required: true
-  standard:
-    description: "Accessibility standard for Pa11y (e.g., WCAG2A, WCAG2AA, WCAG2AAA)."
-    default: "WCAG2AA"
-    required: false
-  threshold:
-    description: "Number of allowed issues before failing the action. 0 fails on any issue (handled by pa11y-ci)."
-    default: "0"
-    required: false
-  wait:
-    description: "Wait time in ms before Pa11y runs (useful for client-side rendering)."
-    default: "0"
-    required: false
-  headers:
-    description: "JSON string of request headers (e.g., '{\"Authorization\": \"Bearer ...\"}')"
+    description: "Single URL to audit (e.g., https://example.com). Ignored if `config` is provided."
     required: false
     default: ""
-  extra_args:
-    description: "Extra CLI args passed verbatim to pa11y-ci (advanced users)."
+  config:
+    description: "Path to a pa11y-ci config file (JSON/YAML). If set, this takes precedence over `url`."
+    required: false
+    default: ""
+  standard:
+    description: "Accessibility standard (WCAG2A, WCAG2AA, WCAG2AAA)."
+    required: false
+    default: "WCAG2AA"
+  threshold:
+    description: "Max allowed issues before failing the action. 0 fails on any issue."
+    required: false
+    default: "0"
+  wait:
+    description: "Wait time in ms before running (helpful for client-side rendering)."
+    required: false
+    default: "0"
+  headers:
+    description: "JSON string of request headers for pa11y-ci (e.g., '{\"Authorization\": \"Bearer ...\"}')."
     required: false
     default: ""
   reporter:
-    description: "Reporter for pa11y-ci output (json or junit)."
+    description: "Reporter for pa11y-ci output (json, csv, html, cli). JSON recommended for CI."
     required: false
     default: "json"
   report_file:
-    description: "Path/filename for the generated report inside the workspace."
+    description: "Output file path for the report (relative to GITHUB_WORKSPACE)."
     required: false
     default: "pa11y-report.json"
-  node_version:
-    description: "Node.js version to use via actions/setup-node."
+  extra_args:
+    description: "Extra CLI args passed verbatim to pa11y-ci (advanced)."
     required: false
-    default: "24"
+    default: ""
 
 outputs:
   report_path:
     description: "Path to the generated report file."
-    value: ${{ steps.run-pa11yci.outputs.report_path }}
   exit_code:
-    description: "Exit code from the pa11y-ci run (0 = success)."
-    value: ${{ steps.run-pa11yci.outputs.exit_code }}
+    description: "Exit code from pa11y-ci (0 = success)."
 
 runs:
-  using: "composite"
-  steps:
-    - name: Set up Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: ${{ inputs.node_version }}
-        cache: 'npm'
-
-    - name: Install pa11y-ci
-      shell: bash
-      run: |
-        set -euo pipefail
-        npm --version
-        # Install pa11y-ci locally in a temp dir to avoid polluting user's repo
-        TMP_NPM_DIR=".pa11yci_tmp_install"
-        mkdir -p "$TMP_NPM_DIR"
-        pushd "$TMP_NPM_DIR" >/dev/null
-        npm init -y >/dev/null 2>&1
-        npm install --no-fund --no-audit pa11y-ci@latest >/dev/null 2>&1 || npm install pa11y-ci@latest
-        echo "PA11Y_CI_BIN=$(pwd)/node_modules/.bin/pa11y-ci" >> $GITHUB_ENV
-        popd >/dev/null
-
-    - name: Generate pa11y-ci config
-      id: gen-config
-      shell: bash
-      env:
-        INPUT_URL: ${{ inputs.url }}
-        INPUT_STANDARD: ${{ inputs.standard }}
-        INPUT_THRESHOLD: ${{ inputs.threshold }}
-        INPUT_WAIT: ${{ inputs.wait }}
-        INPUT_HEADERS: ${{ inputs.headers }}
-        INPUT_REPORTER: ${{ inputs.reporter }}
-        INPUT_REPORT_FILE: ${{ inputs.report_file }}
-      run: |
-        set -euo pipefail
-        WORKDIR="${GITHUB_WORKSPACE:-$(pwd)}"
-        REPORT_PATH="$WORKDIR/${INPUT_REPORT_FILE}"
-        CONFIG_PATH="$WORKDIR/.pa11yci.temp.json"
-
-        # Build defaults JSON
-        DEFAULTS_JSON=$(jq -n --arg standard "$INPUT_STANDARD" --argjson wait ${INPUT_WAIT:-0} '{standard: $standard, wait: $wait, chromeLaunchConfig: {args: ["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage"]}}')
-
-        # If headers provided and valid JSON, merge into defaults
-        if [[ -n "${INPUT_HEADERS}" ]]; then
-          if echo "$INPUT_HEADERS" | jq -e . >/dev/null 2>&1; then
-            DEFAULTS_JSON=$(jq -n --argjson defaults "$DEFAULTS_JSON" --argjson headers "$INPUT_HEADERS" '$defaults + {headers: $headers}')
-          else
-            echo "Provided headers are not valid JSON; aborting." >&2
-            exit 2
-          fi
-        fi
-
-        # Create the pa11y-ci config file
-        jq -n --arg url "$INPUT_URL" --argjson defaults "$DEFAULTS_JSON" '{urls: [$url], defaults: $defaults}' > "$CONFIG_PATH"
-
-        echo "config_path=$CONFIG_PATH" >> "$GITHUB_OUTPUT"
-        echo "report_path=$REPORT_PATH" >> "$GITHUB_OUTPUT"
-
-    - name: Run pa11y-ci
-      id: run-pa11yci
-      shell: bash
-      env:
-        PA11Y_CI_BIN: ${{ env.PA11Y_CI_BIN }}
-        CONFIG_PATH: ${{ steps.gen-config.outputs.config_path }}
-        INPUT_THRESHOLD: ${{ inputs.threshold }}
-        INPUT_REPORTER: ${{ inputs.reporter }}
-        INPUT_REPORT_PATH: ${{ steps.gen-config.outputs.report_path }}
-        INPUT_EXTRA_ARGS: ${{ inputs.extra_args }}
-      run: |
-        set -euo pipefail
-        if [[ -z "${PA11Y_CI_BIN:-}" || ! -x "$PA11Y_CI_BIN" ]]; then
-          echo "pa11y-ci binary not found at $PA11Y_CI_BIN" >&2
-          exit 1
-        fi
-
-        # Build arguments
-        ARGS=("--config" "$CONFIG_PATH" "--threshold" "$INPUT_THRESHOLD")
-        if [[ "$INPUT_REPORTER" == "json" ]]; then
-          ARGS+=("--json")
-        elif [[ "$INPUT_REPORTER" == "junit" ]]; then
-          ARGS+=("--reporter" "junit")
-        fi
-
-        # Handle extra args (split by spaces)
-        if [[ -n "${INPUT_EXTRA_ARGS}" ]]; then
-          # shellcheck disable=SC2206
-          EXTRA_ARR=( $INPUT_EXTRA_ARGS )
-        else
-          EXTRA_ARR=()
-        fi
-
-        set +e
-        "$PA11Y_CI_BIN" "${ARGS[@]}" "${EXTRA_ARR[@]}" > "$INPUT_REPORT_PATH"
-        EXIT_CODE=$?
-        set -e
-
-        echo "Report written to: $INPUT_REPORT_PATH"
-        echo "pa11y-ci exit code: $EXIT_CODE"
-
-        echo "report_path=$INPUT_REPORT_PATH" >> "$GITHUB_OUTPUT"
-        echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
-
-    - name: Fail if pa11y-ci exited non-zero
-      shell: bash
-      run: |
-        set -euo pipefail
-        EXIT_CODE='${{ steps.run-pa11yci.outputs.exit_code }}'
-        if [[ -z "$EXIT_CODE" ]]; then
-          echo "Missing pa11y-ci exit code output." >&2
-          exit 1
-        fi
-        if [[ "$EXIT_CODE" -ne 0 ]]; then
-          echo "pa11y-ci exited with non-zero status: $EXIT_CODE" >&2
-          exit "$EXIT_CODE"
-        fi
-
-    - name: Upload report artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: pa11y-report
-        path: ${{ steps.run-pa11yci.outputs.report_path }}
-        if-no-files-found: warn
+  using: "node24"
+  # Pre & Post hooks for setup/cleanup
+  pre: "dist/pre.js"
+  main: "dist/index.js"
+  post: "dist/post.js"

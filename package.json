@@ -1,0 +1,21 @@
+{
+  "name": "pa11y-action",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "ncc build src/index.js -o dist && ncc build src/pre.js -o dist && ncc build src/post.js -o dist",
+    "lint": "eslint .",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@actions/core": "^1.11.1",
+    "@actions/github": "^6.0.0",
+    "pa11y-ci": "^3.1.0"
+  },
+  "devDependencies": {
+    "@vercel/ncc": "^0.38.1",
+    "eslint": "^9.0.0"
+  }
+}
